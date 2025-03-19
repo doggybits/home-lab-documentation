@@ -1,5 +1,3 @@
-https://github.com/doggybits/home-lab-documentation/tree/main#8-conclusion-and-future-enhancements
-
 # Setting Up a Debian 12 with Netbird and Wazuh
 
 ## __Table of Contents__
