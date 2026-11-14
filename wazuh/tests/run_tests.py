@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 CONTAINER = os.environ.get("CONTAINER", "wazuh-manager")
@@ -14,14 +15,28 @@ PHASE1 = "**Phase 1: Completed pre-decoding."
 
 
 def run_logtest(lines):
-    """Send all lines through one logtest session, return one output block per line."""
+    """Send all lines through one logtest session, return one output block per line.
+    Retries because logtest can lag a few seconds behind analysisd starting."""
     cmd = ["docker", "exec", "-i", CONTAINER, "/var/ossec/bin/wazuh-logtest", "-q"]
     stdin = "\n".join(lines) + "\n"
-    try:
-        out = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=120).stdout
-    except subprocess.TimeoutExpired as e:
-        out = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
-    return out.split(PHASE1)[1:]
+    out = err = ""
+    for attempt in range(1, 7):
+        try:
+            r = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=120)
+            out, err = r.stdout, r.stderr
+        except subprocess.TimeoutExpired as e:
+            out = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+            err = e.stderr.decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
+        blocks = out.split(PHASE1)[1:]
+        if blocks:
+            return blocks
+        print(f"  (attempt {attempt}: no logtest output, retrying in 10s)")
+        time.sleep(10)
+    print("---- logtest stdout ----")
+    print(out[-2000:] or "(empty)")
+    print("---- logtest stderr ----")
+    print(err[-2000:] or "(empty)")
+    return []
 
 
 def parse(block):
@@ -51,8 +66,8 @@ def main():
     total = 0
     for f in files:
         cases = json.loads(f.read_text())
-        blocks = run_logtest([c["log"] for c in cases])
         print(f"\n== {f.name} ==")
+        blocks = run_logtest([c["log"] for c in cases])
         for i, case in enumerate(cases):
             total += 1
             if i >= len(blocks):
