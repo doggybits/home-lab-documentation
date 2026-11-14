@@ -1,0 +1,72 @@
+name: Wazuh ruleset tests
+
+on:
+  push:
+    paths:
+      - "wazuh/**"
+      - ".github/workflows/wazuh-ruleset.yml"
+  pull_request:
+    paths:
+      - "wazuh/**"
+      - ".github/workflows/wazuh-ruleset.yml"
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      # Keep this in step with the version running on Alduin
+      WAZUH_VERSION: "4.14.9"
+      CONTAINER: wazuh-manager
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start Wazuh manager
+        run: docker run -d --name "$CONTAINER" "wazuh/wazuh-manager:${WAZUH_VERSION}"
+
+      - name: Wait for analysisd
+        run: |
+          for i in $(seq 1 60); do
+            if docker exec "$CONTAINER" /var/ossec/bin/wazuh-control status 2>/dev/null | grep -q 'wazuh-analysisd is running'; then
+              echo "analysisd is up"; exit 0
+            fi
+            sleep 5
+          done
+          docker logs "$CONTAINER" | tail -50
+          exit 1
+
+      - name: Load custom decoders, rules and test lists
+        run: |
+          docker cp wazuh/decoders/local_decoder.xml "$CONTAINER":/var/ossec/etc/decoders/local_decoder.xml
+          docker cp wazuh/rules/local_rules.xml      "$CONTAINER":/var/ossec/etc/rules/local_rules.xml
+          docker cp wazuh/tests/lists/known-macs     "$CONTAINER":/var/ossec/etc/lists/known-macs
+          docker exec "$CONTAINER" chown wazuh:wazuh \
+            /var/ossec/etc/decoders/local_decoder.xml \
+            /var/ossec/etc/rules/local_rules.xml \
+            /var/ossec/etc/lists/known-macs
+          # Register the CDB list (same edit made on Alduin)
+          docker exec "$CONTAINER" sed -i \
+            's|<list>etc/lists/audit-keys</list>|&\n    <list>etc/lists/known-macs</list>|' \
+            /var/ossec/etc/ossec.conf
+          docker exec "$CONTAINER" /var/ossec/bin/wazuh-control restart
+
+      - name: Wait for analysisd after restart
+        run: |
+          sleep 10
+          for i in $(seq 1 60); do
+            if docker exec "$CONTAINER" /var/ossec/bin/wazuh-control status 2>/dev/null | grep -q 'wazuh-analysisd is running'; then
+              echo "analysisd is up"; exit 0
+            fi
+            sleep 5
+          done
+          echo "analysisd did not start - likely an XML error in a rule or decoder:"
+          docker exec "$CONTAINER" tail -n 40 /var/ossec/logs/ossec.log
+          exit 1
+
+      - name: Run detection tests
+        run: python3 wazuh/tests/run_tests.py
+
+      - name: Show Wazuh log on failure
+        if: failure()
+        run: docker exec "$CONTAINER" tail -n 60 /var/ossec/logs/ossec.log || true

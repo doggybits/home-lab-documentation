@@ -1,0 +1,91 @@
+<!-- Local rules -->
+
+<!-- Modify it at your will. -->
+<!-- Copyright (C) 2015, Wazuh Inc. -->
+
+<!-- GL.iNet Slate Plus (OpenWrt) firewall rules -->
+<group name="openwrt,firewall,">
+
+  <!-- Inbound traffic blocked on the WAN zone -->
+  <rule id="100201" level="5">
+    <if_sid>5100</if_sid>
+    <field name="zone">wan</field>
+    <field name="direction">in</field>
+    <description>Slate: inbound WAN traffic blocked ($(action)) from $(srcip)</description>
+    <group>firewall_drop,nist_800_53_SC.7,nist_800_53_SI.4,</group>
+  </rule>
+
+  <!-- Noise: replies to the Slate's own connectivity-check pings -->
+  <rule id="100203" level="0">
+    <if_sid>100201</if_sid>
+    <protocol>ICMP</protocol>
+    <match>SRC=8.8.8.8 |SRC=1.1.1.1 |SRC=208.67.222.222 |SRC=208.67.220.220 </match>
+    <description>Slate: dropped reply to router connectivity check (ignored)</description>
+  </rule>
+
+  <!-- Possible port scan: many WAN blocks from one source in a short window -->
+  <rule id="100202" level="10" frequency="8" timeframe="60">
+    <if_matched_sid>100201</if_matched_sid>
+    <same_srcip />
+    <description>Slate: possible port scan from $(srcip) (8+ blocked WAN connections in 60s)</description>
+    <group>recon,nist_800_53_SC.7,nist_800_53_SI.4,</group>
+  </rule>
+
+  <rule id="100204" level="0">
+    <if_sid>100201</if_sid>
+    <protocol>UDP</protocol>
+    <match>DST=224.0.0.251 |DST=ff02:0000:0000:0000:0000:0000:0000:00fb</match>
+    <description>Slate: Dropped mDNS multicast on WAN (ignored)</description>
+  </rule>
+
+  <rule id="100205" level="0">
+    <if_sid>100201</if_sid>
+    <dstip>255.255.255.255</dstip>
+    <description>Slate: ignore WAN broadcast drops (DHCP,KDE Connect Discovery, etc.)</description>
+  </rule>
+
+</group>
+
+<!-- Windows Sysmon tuning -->
+<group name="sysmon,windows,local,">
+
+  <!-- Noise: Disk Cleanup (SilentCleanup task) staging DISM files into %TEMP%\{GUID}\ -->
+  <rule id="100210" level="0">
+    <if_sid>92213</if_sid>
+    <field name="win.eventdata.image" type="pcre2">(?i)^C:\\\\Windows\\\\System32\\\\cleanmgr\.exe$</field>
+    <field name="win.eventdata.targetFilename" type="pcre2">(?i)\\\\AppData\\\\Local\\\\Temp\\\\[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}\\\\(Dism\w*|\w+Provider)\.(dll|exe)$</field>
+    <description>Sysmon: cleanmgr.exe staging DISM providers in temp (ignored)</description>
+  </rule>
+
+  <!-- Possible SilentCleanup / DismHost UAC bypass: another process plants a provider DLL in the GUID temp folder -->
+  <rule id="100211" level="12">
+    <if_sid>92213</if_sid>
+    <field name="win.eventdata.image" type="pcre2" negate="yes">(?i)\\\\cleanmgr\.exe$</field>
+    <field name="win.eventdata.targetFilename" type="pcre2">(?i)\\\\AppData\\\\Local\\\\Temp\\\\[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}\\\\\w+Provider\.dll$</field>
+    <description>Sysmon: possible UAC bypass - $(win.eventdata.image) wrote a DISM provider DLL into a cleanmgr temp folder</description>
+    <mitre>
+      <id>T1548.002</id>
+    </mitre>
+    <group>privilege_escalation,nist_800_53_SI.4,nist_800_53_AC.6,</group>
+  </rule>
+
+</group><!-- GL.iNet Slate Plus (OpenWrt) DHCP rules -->
+<group name="openwrt,dhcp,">
+
+  <rule id="100220" level="0">
+    <decoded_as>slate-dnsmasq-dhcp</decoded_as>
+    <match>DHCPACK</match>
+    <description>Slate: DHCP lease to $(mac) ($(client_name)) at $(srcip)</description>
+  </rule>
+
+  <rule id="100221" level="8">
+    <if_sid>100220</if_sid>
+    <list field="mac" lookup="not_match_key">etc/lists/known-macs</list>
+    <description>Slate: unknown device joined lab network: $(mac) ($(client_name)) at $(srcip)</description>
+    <mitre>
+      <id>T1200</id>
+    </mitre>
+    <group>new_device,nist_800_53_CM.8,nist_800_53_SI.4,</group>
+  </rule>
+
+</group>
