@@ -1,58 +1,66 @@
 #!/usr/bin/env python3
-"""Run every test case in wazuh/tests/cases/*.json through wazuh-logtest
-inside the running Wazuh manager container and compare the results."""
+"""Run every test case in tests/cases/*.json through the Wazuh logtest service
+and compare the results.
+
+Runs ON the Wazuh manager (inside the CI container, or on Alduin), as root:
+  /var/ossec/framework/python/bin/python3 run_tests.py
+"""
 import json
-import os
-import re
-import subprocess
+import socket
+import struct
 import sys
 import time
 from pathlib import Path
 
-CONTAINER = os.environ.get("CONTAINER", "wazuh-manager")
+LOGTEST_SOCKET = "/var/ossec/queue/sockets/logtest"
 CASES_DIR = Path(__file__).parent / "cases"
-PHASE1 = "**Phase 1: Completed pre-decoding."
 
 
-def run_logtest(lines):
-    """Send all lines through one logtest session, return one output block per line.
-    Retries because logtest can lag a few seconds behind analysisd starting."""
-    cmd = ["docker", "exec", "-i", CONTAINER, "/var/ossec/bin/wazuh-logtest", "-q"]
-    stdin = "\n".join(lines) + "\n"
-    out = err = ""
-    for attempt in range(1, 7):
+def logtest(event, token=None):
+    """Send one event to the logtest socket and return the decoded JSON reply."""
+    request = {
+        "version": 1,
+        "origin": {"name": "run_tests", "module": "wazuh-logtest"},
+        "command": "log_processing",
+        "parameters": {"event": event, "log_format": "syslog", "location": "stdin"},
+    }
+    if token:
+        request["parameters"]["token"] = token
+    payload = json.dumps(request).encode()
+
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(LOGTEST_SOCKET)
+    s.sendall(struct.pack("<I", len(payload)) + payload)
+    size = struct.unpack("<I", s.recv(4, socket.MSG_WAITALL))[0]
+    reply = s.recv(size, socket.MSG_WAITALL)
+    s.close()
+    return json.loads(reply.decode())
+
+
+def wait_for_logtest(retries=12, delay=5):
+    for attempt in range(1, retries + 1):
         try:
-            r = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=120)
-            out, err = r.stdout, r.stderr
-        except subprocess.TimeoutExpired as e:
-            out = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
-            err = e.stderr.decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
-        blocks = out.split(PHASE1)[1:]
-        if blocks:
-            return blocks
-        print(f"  (attempt {attempt}: no logtest output, retrying in 10s)")
-        time.sleep(10)
-    print("---- logtest stdout ----")
-    print(out[-2000:] or "(empty)")
-    print("---- logtest stderr ----")
-    print(err[-2000:] or "(empty)")
-    return []
+            logtest("warmup")
+            return True
+        except (FileNotFoundError, ConnectionRefusedError, OSError) as e:
+            print(f"  (logtest not ready, attempt {attempt}: {e})")
+            time.sleep(delay)
+    return False
 
 
-def parse(block):
-    decoder = re.search(r"\*\*Phase 2: Completed decoding\.\s+name: '([^']+)'", block)
-    phase3 = block.split("**Phase 3: Completed filtering (rules).", 1)
-    rule = level = None
-    if len(phase3) == 2:
-        rid = re.search(r"id: '(\d+)'", phase3[1])
-        lvl = re.search(r"level: '(\d+)'", phase3[1])
-        rule = rid.group(1) if rid else None
-        level = int(lvl.group(1)) if lvl else None
+def summarize(reply):
+    data = reply.get("data", {})
+    out = data.get("output", {}) or {}
+    decoder = out.get("decoder", {}) or {}
+    rule = out.get("rule", {}) or {}
     return {
-        "decoder": decoder.group(1) if decoder else None,
-        "rule": rule,
-        "level": level,
-        "alert": "**Alert to be generated." in block,
+        "error": reply.get("error", 0),
+        "messages": data.get("messages", []),
+        "token": data.get("token"),
+        "decoders": {decoder.get("name"), decoder.get("parent")} - {None},
+        "rule": rule.get("id"),
+        "level": rule.get("level"),
+        "alert": bool(data.get("alert", False)),
     }
 
 
@@ -61,24 +69,36 @@ def main():
     if not files:
         print(f"No test cases found in {CASES_DIR}")
         return 1
+    if not wait_for_logtest():
+        print(f"Could not reach the logtest socket at {LOGTEST_SOCKET}")
+        return 1
 
-    failures = 0
-    total = 0
+    failures = total = 0
     for f in files:
-        cases = json.loads(f.read_text())
         print(f"\n== {f.name} ==")
-        blocks = run_logtest([c["log"] for c in cases])
-        for i, case in enumerate(cases):
+        token = None
+        for case in json.loads(f.read_text()):
             total += 1
-            if i >= len(blocks):
-                print(f"  FAIL  {case['name']}: no logtest output for this line")
+            try:
+                got = summarize(logtest(case["log"], token))
+            except Exception as e:  # noqa: BLE001
                 failures += 1
+                print(f"  FAIL  {case['name']}: {e}")
                 continue
-            got = parse(blocks[i])
+            token = got["token"] or token
+
             problems = []
-            for key in ("decoder", "rule", "level", "alert"):
-                if key in case and str(case[key]) != str(got[key]):
-                    problems.append(f"{key}: expected {case[key]!r}, got {got[key]!r}")
+            if got["error"]:
+                problems.append(f"logtest error {got['error']}: {got['messages']}")
+            if "decoder" in case and case["decoder"] not in got["decoders"]:
+                problems.append(f"decoder: expected {case['decoder']!r}, got {sorted(got['decoders']) or None}")
+            if "rule" in case and str(case["rule"]) != str(got["rule"]):
+                problems.append(f"rule: expected {case['rule']!r}, got {got['rule']!r}")
+            if "level" in case and str(case["level"]) != str(got["level"]):
+                problems.append(f"level: expected {case['level']!r}, got {got['level']!r}")
+            if "alert" in case and bool(case["alert"]) != got["alert"]:
+                problems.append(f"alert: expected {case['alert']!r}, got {got['alert']!r}")
+
             if problems:
                 failures += 1
                 print(f"  FAIL  {case['name']}")

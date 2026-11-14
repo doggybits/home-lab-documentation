@@ -65,7 +65,9 @@ jobs:
           exit 1
 
       - name: Run detection tests
-        run: python3 wazuh/tests/run_tests.py
+        run: |
+          docker cp wazuh/tests "$CONTAINER":/tmp/tests
+          docker exec "$CONTAINER" /var/ossec/framework/python/bin/python3 /tmp/tests/run_tests.py
 
       - name: Show Wazuh log on failure
         if: failure()
